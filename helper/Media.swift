@@ -2,10 +2,20 @@
 import CoreGraphics
 import Speech
 
-/// On-device transcription with macOS 26's SpeechAnalyzer: finalized results only, each word with
-/// its own audio time range.
+/// On-device transcription. macOS 26's SpeechAnalyzer when the helper is built with its SDK and runs
+/// there (finalized results only, each word with its own audio time range); otherwise the older
+/// on-device SFSpeechRecognizer, whose segments carry word timings too.
 enum Transcriber {
   static func transcribe(_ url: URL) async throws -> [String: Any] {
+    #if compiler(>=6.2)
+    if #available(macOS 26, *) { return try await analyzerTranscribe(url) }
+    #endif
+    return try await recognizerTranscribe(url)
+  }
+
+  #if compiler(>=6.2)
+  @available(macOS 26, *)
+  private static func analyzerTranscribe(_ url: URL) async throws -> [String: Any] {
     var found = await SpeechTranscriber.supportedLocale(equivalentTo: Locale.current)
     if found == nil { found = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) }
     guard let locale = found else { throw HelperError("SpeechTranscriber has no supported locale") }
@@ -50,6 +60,7 @@ enum Transcriber {
     ]
   }
 
+  @available(macOS 26, *)
   private static func transcribeSingle(_ url: URL, locale: Locale, offsetMs: Int) async throws -> ([[String: Any]], [[String: Any]]) {
     let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [.audioTimeRange])
     let file = try AVAudioFile(forReading: url)
@@ -68,6 +79,90 @@ enum Transcriber {
       segments.append(["t0": ms(result.range.start) + offsetMs, "t1": ms(result.range.end) + offsetMs, "text": text])
     }
     withExtendedLifetime(analyzer) {}
+    return (segments, words)
+  }
+  #endif
+
+  /// macOS 15 path: SFSpeechRecognizer, on-device only so narration never leaves the Mac. Chunks run
+  /// one after another; the recognizer is not built for concurrent tasks.
+  private static func recognizerTranscribe(_ url: URL) async throws -> [String: Any] {
+    try await authorizeSpeech()
+    let candidates = [Locale.current, Locale(identifier: "en-US")]
+    guard let recognizer = candidates.lazy.compactMap({ SFSpeechRecognizer(locale: $0) }).first(where: { $0.supportsOnDeviceRecognition }) else {
+      throw HelperError("On-device speech recognition is unavailable (turn on Dictation in System Settings › Keyboard to download it)")
+    }
+    recognizer.queue = OperationQueue()
+    let chunks = try? splitWavAtSilences(url)
+    defer { if let chunks { try? FileManager.default.removeItem(at: chunks.dir) } }
+    let files = chunks?.files ?? [(offsetMs: 0, url: url)]
+    var segments: [[String: Any]] = []
+    var words: [[String: Any]] = []
+    for item in files {
+      let (segs, wrds) = try await recognize(item.url, with: recognizer, offsetMs: item.offsetMs)
+      segments.append(contentsOf: segs)
+      words.append(contentsOf: wrds)
+    }
+    return [
+      "engine": "sf-speech-recognizer",
+      "locale": recognizer.locale.identifier,
+      "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
+      "segments": segments,
+      "words": words,
+    ]
+  }
+
+  private static func authorizeSpeech() async throws {
+    let status = await withCheckedContinuation { cont in
+      SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0) }
+    }
+    guard status == .authorized else { throw HelperError("Speech recognition permission was not granted") }
+  }
+
+  private static func recognize(_ url: URL, with recognizer: SFSpeechRecognizer, offsetMs: Int) async throws -> ([[String: Any]], [[String: Any]]) {
+    let request = SFSpeechURLRecognitionRequest(url: url)
+    request.requiresOnDeviceRecognition = true
+    request.shouldReportPartialResults = false
+    request.addsPunctuation = true
+    request.taskHint = .dictation
+    let transcription: SFTranscription? = try await withCheckedThrowingContinuation { cont in
+      let lock = NSLock()
+      var resumed = false
+      func finish(_ outcome: Result<SFTranscription?, Error>) {
+        lock.lock(); defer { lock.unlock() }
+        guard !resumed else { return }
+        resumed = true
+        cont.resume(with: outcome)
+      }
+      _ = recognizer.recognitionTask(with: request) { result, error in
+        if let result, result.isFinal {
+          finish(.success(result.bestTranscription))
+        } else if let error {
+          // 1110: "No speech detected", which is a silent chunk rather than a failure.
+          let ns = error as NSError
+          finish(ns.domain == "kAFAssistantErrorDomain" && ns.code == 1110 ? .success(nil) : .failure(error))
+        }
+      }
+    }
+    guard let transcription else { return ([], []) }
+    var words: [[String: Any]] = []
+    var segments: [[String: Any]] = []
+    var current: [(t0: Int, t1: Int, text: String)] = []
+    func closeSegment() {
+      guard let first = current.first, let last = current.last else { return }
+      segments.append(["t0": first.t0, "t1": last.t1, "text": current.map(\.text).joined(separator: " ")])
+      current.removeAll()
+    }
+    for segment in transcription.segments {
+      let text = segment.substring.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !text.isEmpty else { continue }
+      let t0 = Int((segment.timestamp * 1000).rounded()) + offsetMs
+      let t1 = Int(((segment.timestamp + segment.duration) * 1000).rounded()) + offsetMs
+      // A pause of 0.8 s or more starts a new segment, roughly where SpeechAnalyzer would.
+      if let last = current.last, t0 - last.t1 >= 800 { closeSegment() }
+      words.append(["t0": t0, "t1": t1, "text": text])
+      current.append((t0, t1, text))
+    }
+    closeSegment()
     return (segments, words)
   }
 

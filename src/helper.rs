@@ -111,21 +111,29 @@ pub fn devices() -> Result<Vec<PhoneDevice>> {
 
 #[derive(Deserialize)]
 struct Transcript {
+    /// Set by the macOS 15 fallback (`sf-speech-recognizer`); absent means SpeechAnalyzer.
+    #[serde(default)]
+    engine: Option<String>,
     locale: String,
     text: String,
     segments: Vec<TranscriptSegment>,
     words: Vec<WordTiming>,
 }
 
-/// On-device SpeechAnalyzer transcription with measured word timings.
+/// On-device transcription with measured word timings: SpeechAnalyzer on macOS 26, the older
+/// SFSpeechRecognizer before it.
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     let transcript: Transcript = run(
         &[os("transcribe"), audio.as_os_str()],
         Duration::from_secs(180),
     )?;
+    let (source, model) = match transcript.engine.as_deref() {
+        Some("sf-speech-recognizer") => ("sf-speech-recognizer", "SFSpeechRecognizer"),
+        _ => ("speech-analyzer", "SpeechTranscriber"),
+    };
     Ok(TranscriptData {
-        source: "speech-analyzer".into(),
-        model: Some(format!("SpeechTranscriber {}", transcript.locale)),
+        source: source.into(),
+        model: Some(format!("{model} {}", transcript.locale)),
         text: transcript.text,
         segments: transcript.segments,
         words: transcript.words,
