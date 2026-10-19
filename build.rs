@@ -5,7 +5,9 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
-    compile_laser_shader();
+    for shader in ["src/laser_overlay.metal", "src/native/pill/pill.metal"] {
+        println!("cargo:rerun-if-changed={shader}");
+    }
     compile_helper();
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     if let Ok(output) = Command::new("xcode-select").arg("-p").output()
@@ -20,42 +22,6 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{swift_runtime}");
         }
     }
-}
-
-fn compile_laser_shader() {
-    for (src_rel, name) in [
-        ("src/laser_overlay.metal", "laser_overlay"),
-        ("src/native/pill/pill.metal", "pill"),
-    ] {
-        compile_metal_shader(src_rel, name);
-    }
-}
-
-fn compile_metal_shader(src_rel: &str, name: &str) {
-    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let output_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let source = manifest_dir.join(src_rel);
-    let air = output_dir.join(format!("{name}.air"));
-    let library = output_dir.join(format!("{name}.metallib"));
-    println!("cargo:rerun-if-changed={}", source.display());
-
-    let metal = Command::new("xcrun")
-        .args(["--sdk", "macosx", "metal", "-c", "-mmacosx-version-min=15.0"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&air)
-        .status()
-        .expect("xcrun metal is required to build Metal shaders");
-    assert!(metal.success(), "Metal shader compilation failed for {src_rel}");
-
-    let metallib = Command::new("xcrun")
-        .args(["--sdk", "macosx", "metallib"])
-        .arg(&air)
-        .arg("-o")
-        .arg(&library)
-        .status()
-        .expect("xcrun metallib is required to build Metal shaders");
-    assert!(metallib.success(), "Metal library creation failed for {src_rel}");
 }
 
 /// Builds `scrawl-helper` (Swift: SpeechAnalyzer, iPhone capture, movie decoding) beside the
@@ -108,7 +74,7 @@ fn compile_helper() {
         .expect("xcrun swiftc is required to build scrawl-helper");
     assert!(
         status.success(),
-        "scrawl-helper failed to compile (needs the macOS 26 SDK; the result runs on macOS 15)"
+        "scrawl-helper failed to compile (needs the macOS 15 SDK or newer)"
     );
     let dest = profile_dir.join("scrawl-helper");
     let _ = std::fs::remove_file(&dest);
