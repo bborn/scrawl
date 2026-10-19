@@ -40,3 +40,8 @@ opt-level = 2
 [profile.dev.package."*"]
 opt-level = 2
 
+
+# Builds with the macOS 15 SDK: guards apple-metal's macOS 26-only Metal calls (MTLTensor,
+# sampler reductionMode/lodBias) at compile time as well as at runtime.
+[patch.crates-io]
+apple-metal = { path = "vendor/apple-metal" }
